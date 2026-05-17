@@ -944,6 +944,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             patch(api::update_session_diff_base),
         )
         .route("/api/sessions/{id}/terminal", post(api::ensure_terminal))
+        .route("/api/sessions/{id}/hibernate", post(api::hibernate_session))
         .route(
             "/api/sessions/{id}/container-terminal",
             post(api::ensure_container_terminal),
@@ -1353,6 +1354,8 @@ fn load_all_instances() -> anyhow::Result<Vec<Instance>> {
 /// and keeps TUI/CLI callers unchanged.
 async fn status_poll_loop(state: Arc<AppState>) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    let mut last_hibernate_check = std::time::Instant::now();
+    const HIBERNATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
     #[cfg(feature = "serve")]
     let mut attempted_cockpit_spawns: std::collections::HashSet<String> =
         std::collections::HashSet::new();
@@ -1445,6 +1448,75 @@ async fn status_poll_loop(state: Arc<AppState>) {
                     }
                 }
             }
+            // Auto-hibernate: only run the (potentially expensive) config
+            // resolution every 60s, not on every 2s poll tick.
+            if last_hibernate_check.elapsed() >= HIBERNATE_CHECK_INTERVAL {
+                last_hibernate_check = std::time::Instant::now();
+
+                let hibernate_candidates: Vec<_> = instances
+                    .iter()
+                    .filter(|inst| {
+                        inst.status == Status::Idle && inst.can_hibernate() && {
+                            let config =
+                                crate::session::resolve_config_or_warn(&inst.source_profile);
+                            let threshold = config.session.hibernate_after_minutes;
+                            threshold > 0
+                                && inst.idle_entered_at.is_some_and(|entered| {
+                                    now.signed_duration_since(entered)
+                                        >= chrono::Duration::minutes(threshold as i64)
+                                })
+                        }
+                    })
+                    .cloned()
+                    .collect();
+
+                let mut hibernated_ids: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for inst in &hibernate_candidates {
+                    if let Err(e) = inst.hibernate() {
+                        tracing::error!("Serve auto-hibernate failed for {}: {}", inst.id, e);
+                        continue;
+                    }
+                    hibernated_ids.insert(inst.id.clone());
+                    let _ = state.status_tx.send(StatusChange {
+                        instance_id: inst.id.clone(),
+                        instance_title: inst.title.clone(),
+                        old: Status::Idle,
+                        new: Status::Hibernated,
+                        at: now,
+                    });
+                }
+
+                if !hibernated_ids.is_empty() {
+                    for inst in &mut instances {
+                        if hibernated_ids.contains(&inst.id) {
+                            inst.status = Status::Hibernated;
+                        }
+                    }
+                    let mut profiles_to_save: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for c in &hibernate_candidates {
+                        if hibernated_ids.contains(&c.id) {
+                            profiles_to_save.insert(c.source_profile.clone());
+                        }
+                    }
+                    for profile in &profiles_to_save {
+                        if let Ok(storage) = Storage::new(profile) {
+                            let profile_instances: Vec<_> = instances
+                                .iter()
+                                .filter(|i| i.source_profile == *profile)
+                                .cloned()
+                                .collect();
+                            if let Err(e) = storage.save(&profile_instances) {
+                                tracing::error!(
+                                    "Failed to save after auto-hibernate (profile {profile}): {e}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             *state.instances.write().await = instances;
 
             #[cfg(feature = "serve")]
@@ -1659,7 +1731,7 @@ pub(crate) fn apply_status_intent(
     // want the spinner to flicker back to Running.
     if matches!(
         inst.status,
-        Status::Stopped | Status::Deleting | Status::Creating
+        Status::Stopped | Status::Hibernated | Status::Deleting | Status::Creating
     ) {
         return;
     }
