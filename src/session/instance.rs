@@ -1632,6 +1632,8 @@ impl Instance {
     /// next attach. Unlike stop(), does not clean up hook status files.
     pub fn hibernate(&self) -> Result<()> {
         self.kill()?;
+        let _ = self.kill_terminal();
+        let _ = self.kill_container_terminal();
 
         if self.is_sandboxed() {
             let container = containers::DockerContainer::from_session_id(&self.id);

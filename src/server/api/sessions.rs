@@ -795,6 +795,7 @@ pub async fn delete_session(
             delete_branch: body.delete_branch,
             delete_sandbox: body.delete_sandbox,
             force_delete: body.force_delete,
+            detach_hooks: true,
         })
     })
     .await;
@@ -826,7 +827,11 @@ pub async fn delete_session(
         }
         Ok(result) => {
             // Deletion had errors; set status to Error
-            let error_msg = result.error.unwrap_or_else(|| "Unknown error".to_string());
+            let error_msg = if result.errors.is_empty() {
+                "Unknown error".to_string()
+            } else {
+                result.errors.join("; ")
+            };
             {
                 let mut instances = state.instances.write().await;
                 if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
